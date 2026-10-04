@@ -6882,7 +6882,64 @@ class CommandHubApp(ShowBase):
         except Exception:
             return False
 
+    def _snapshot_native_listener_owners(self) -> set:
+        owners = set()
+        try:
+            msg = self._real_panda_messenger()
+            for event in msg.getEvents():
+                for entry in (msg.whoAccepts(event) or {}).values():
+                    fn = entry[0] if isinstance(entry, (list, tuple)) else entry
+                    owner = getattr(fn, "__self__", None)
+                    if owner is not None:
+                        owners.add(id(owner))
+        except Exception:
+            pass
+        return owners
+
+    def _destroy_orphaned_native_gui(self, label: str = "") -> int:
+        """Destroy DirectGui widgets a dimension left behind once their nodes were purged.
+
+        _purge_native_scene_residue removes a dimension's leftover 2-D nodes, but a DirectButton
+        removed that way keeps its click listeners on the messenger (Zonez left 17 per visit).
+        Only widgets created during the visit and no longer attached to the 2-D scene are touched.
+        """
+        baseline = getattr(self, "native_listener_baseline", None)
+        if not isinstance(baseline, set):
+            return 0
+        try:
+            from direct.gui.DirectGuiBase import DirectGuiBase
+            msg = self._real_panda_messenger()
+        except Exception:
+            return 0
+        roots = [r for r in (getattr(self, "render2d", None), getattr(self, "render", None)) if r is not None]
+        orphans = {}
+        for event in list(msg.getEvents()):
+            for entry in list((msg.whoAccepts(event) or {}).values()):
+                fn = entry[0] if isinstance(entry, (list, tuple)) else entry
+                owner = getattr(fn, "__self__", None)
+                if owner is None or id(owner) in baseline or not isinstance(owner, DirectGuiBase):
+                    continue
+                try:
+                    attached = (not owner.isEmpty()) and any(owner.getTop() == root for root in roots)
+                except Exception:
+                    attached = False
+                if not attached:
+                    orphans[id(owner)] = owner
+        for owner in orphans.values():
+            try:
+                owner.destroy()
+            except Exception:
+                pass
+            try:
+                msg.ignoreAll(owner)
+            except Exception:
+                pass
+        if orphans:
+            print(f"native_mode_gui_residue_destroyed label={label} count={len(orphans)}")
+        return len(orphans)
+
     def suspend_for_native_mode(self, label: str):
+        self.native_listener_baseline = self._snapshot_native_listener_owners()
         self.native_scene_baseline = self._snapshot_native_scene_state()
         self.native_task_baseline = self._snapshot_native_task_state()
         # Capture the host presentation BEFORE any handoff helper closes UI,
@@ -7282,6 +7339,11 @@ class CommandHubApp(ShowBase):
             self._remove_native_import_root()
         except Exception:
             pass
+        try:
+            self._destroy_orphaned_native_gui(str(getattr(self, "native_mode_label", "") or ""))
+        except Exception:
+            pass
+        self.native_listener_baseline = None
         host_update_alive = self._ensure_host_update_task_alive()
         host_input_ready = False
         try:
@@ -12155,6 +12217,55 @@ class CommandHubApp(ShowBase):
     def native_v_down(self):
         if getattr(self, "active_native_mode", None) is not None:
             return
+
+    def request_dimension_return(self, reason: str = "dimension_exit", *args, **kwargs) -> bool:
+        """Return home when a dimension's own exit asks for it (Zonez calls this from its update()).
+
+        Deferred one frame so it never tears the dimension down inside its own update or key handler.
+        """
+        if getattr(self, "active_native_mode", None) is None:
+            return False
+        try:
+            self.taskMgr.doMethodLater(0.0, lambda task: (self.return_from_native_mode(reason=str(reason or "dimension_exit")), task.done)[1], "native-dimension-return-request")
+        except Exception:
+            self.return_from_native_mode(reason=str(reason or "dimension_exit"))
+        return True
+
+    return_to_hub = request_dimension_return
+
+    def push_nested_native_entry(self, target: Path, label: str = "", source: str = "") -> bool:
+        """Open another same-window dimension from inside the current one (The Archivist's books).
+
+        Without this hook The Archivist fell back to ``subprocess.run(...)``, which blocks HoloVerse's
+        main loop, freezing the window until the simulation closed.  The target opens in place of the
+        current dimension when its folder has a native adapter; TAB still returns home.  Anything else
+        is refused, so the caller shows its own "no native adapter" message instead of blocking.
+        """
+        try:
+            target = Path(target)
+            folder = target.parent if target.suffix.lower() == ".py" else target
+            entry = target if target.suffix.lower() == ".py" else folder / "main.py"
+        except Exception:
+            return False
+        mode = {"name": str(label or folder.name), "folder": folder,
+                "manifest": {"native_adapter": MODE_NATIVE_ADAPTER_NAME, "title": str(label or folder.name)}}
+        if self._mode_adapter_path(mode) is None or not entry.is_file():
+            print(f"native_nested_entry_refused label={label} source={source} reason=no_native_adapter")
+            return False
+        nested_label = str(label or folder.name)
+
+        def swap(task):
+            self.return_from_native_mode(reason="nested_entry")
+            if not self.launch_native_mode(mode, entry, nested_label, source=str(source or "nested")):
+                print(f"native_nested_entry_failed label={nested_label} source={source}")
+            return task.done
+
+        try:
+            self.taskMgr.doMethodLater(0.0, swap, "native-nested-entry")
+        except Exception:
+            return False
+        print(f"native_nested_entry label={nested_label} source={source}")
+        return True
 
     def handle_tab_action(self):
         """Universal player-facing return law: TAB always returns to MatrixCore home."""
