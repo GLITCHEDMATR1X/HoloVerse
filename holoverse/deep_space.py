@@ -49,6 +49,7 @@ from panda3d.core import (
     InternalName,
     KeyboardButton,
     LineSegs,
+    MouseButton,
     NodePath,
     PerspectiveLens,
     PNMImage,
@@ -71,8 +72,9 @@ THRUSTER_SPEED = 95.0            # lateral / vertical thruster target speed
 ACCEL = 170.0                    # m/s^2 with flight assist on
 FA_OFF_ACCEL = 120.0             # m/s^2 with flight assist off
 BOOST_MULT = 1.75
-BOOST_TIME = 2.6
-BOOST_COOLDOWN = 4.5
+BOOST_DRAIN = 0.32               # Pass 282.75: hold Shift to boost; energy drains while held ...
+BOOST_RECHARGE = 0.22            # ... and refills once released
+BOOST_RECHARGE_DELAY = 0.6
 THROTTLE_RATE = 0.65             # throttle change per second while W/S held
 PITCH_RATE = 46.0                # deg/s at full stick
 YAW_RATE = 30.0
@@ -87,10 +89,18 @@ SC_MAX_SPEED = 30000.0           # m/s at full throttle in supercruise
 SC_RESPONSE = 0.45               # speed blend per second in supercruise
 SC_TURN_SCALE = 0.55
 SHIP_RADIUS = 6.0
+LASER_RANGE = 4500.0             # Pass 282.75: left click fires at asteroids
+LASER_COOLDOWN = 0.16
+LASER_SHOW_TIME = 0.10
+BURST_TIME = 0.75
 
 CELL_SIZE = 3000.0
-CELL_RADIUS = 2                  # 5 x 5 x 5 cells around the ship
-CELL_BUILDS_PER_FRAME = 2
+CELL_RADIUS = 3                  # Pass 282.75: 7 x 7 x 7 cells, so rock fields show from ~10 km away
+CELL_BUILDS_PER_FRAME = 3
+FIELD_FADE_FAR = 10500.0         # a rock field is invisible beyond this ...
+FIELD_FADE_NEAR = 7500.0         # ... and fully solid inside this
+FIELD_FADE_IN_TIME = 1.4         # a newly streamed field also fades in over this long
+COLLIDE_CELL_RADIUS = 1          # collisions only test the 3 x 3 x 3 cells around the ship
 CLUSTER_CHANCE = 0.20           # Pass 282.70: emptier, more open space between rock fields
 BEACON_CHANCE = 0.04
 
@@ -295,8 +305,15 @@ class DeepSpaceFlight:
         self.stick = [0.0, 0.0]
         self.throttle = 0.0
         self.flight_assist = True
-        self.boost_left = 0.0
-        self.boost_cooldown = 0.0
+        self.boosting = False
+        self.boost_energy = 1.0
+        self.boost_idle = 0.0
+        self.laser_cooldown = 0.0
+        self.laser_time = 0.0
+        self.bursts: list = []
+        self.destroyed: set = set()                          # (cell key, rock index) shot this session
+        self.rocks_destroyed = 0
+        self.theme_index = 0
         self.mode = "normal"                                  # normal | charging | supercruise
         self.charge = 0.0
         self.approach = 0.0
@@ -365,6 +382,7 @@ class DeepSpaceFlight:
 
         # --- cockpit (camera child) and HUD (aspect2d) -------------------------
         self._build_cockpit()
+        self._build_weapon_fx()
         self._build_hud()
         # Pass 282.64: the Dimension Archive's realities as distant planets.
         try:
@@ -665,46 +683,103 @@ class DeepSpaceFlight:
             tile.instanceTo(holder)
             self.dust_tiles.append(holder)
 
+    # Pass 282.75: cockpit colour themes (C cycles them).  The octagonal window stays clear in
+    # every theme; the hull, the tinted outer glass and the trim take the theme colours.
+    COCKPIT_THEMES = (
+        {"name": "CYAN",    "hull": (0.10, 0.13, 0.17), "glass": (0.30, 0.75, 0.95), "trim": (0.40, 0.95, 1.00)},
+        {"name": "VIOLET",  "hull": (0.13, 0.09, 0.19), "glass": (0.62, 0.38, 0.95), "trim": (0.86, 0.48, 1.00)},
+        {"name": "AMBER",   "hull": (0.17, 0.12, 0.08), "glass": (0.95, 0.62, 0.28), "trim": (1.00, 0.72, 0.28)},
+        {"name": "EMERALD", "hull": (0.07, 0.15, 0.12), "glass": (0.30, 0.90, 0.62), "trim": (0.40, 1.00, 0.70)},
+    )
+    CANOPY_Y = 1.25                     # canopy plane distance in front of the eye (camera space)
+    WINDOW_HALF = (0.86, 0.47)          # half width / height of the clear octagon window
+    WINDOW_CENTRE_Z = 0.06
+    OUTER_HALF = (1.55, 0.95)           # outer glass edge, past the screen edges at 82 degrees
+
+    def _octagon(self, half_x: float, half_z: float, cz: float):
+        pts = []
+        for k in range(8):
+            a = math.radians(22.5 + 45.0 * k)
+            pts.append((math.cos(a) / math.cos(math.radians(22.5)) * half_x, math.sin(a) / math.cos(math.radians(22.5)) * half_z + cz))
+        return pts
+
     def _build_cockpit(self) -> None:
-        """Solid canopy frame and dash with holo panels, parented to the camera."""
+        """Octagonal canopy (Pass 282.75): a clear octagon window in a framed, tinted glass canopy.
+
+        Everything is camera space and drawn in a late fixed bin, so it always sits in front of
+        space.  Hull, glass and trim are built white/grey and coloured by the active theme."""
         root = self.app.camera.attachNewNode("deep-space-cockpit")
-        m = _Mesh("deep-space-cockpit-frame")
-        frame = (0.035, 0.040, 0.050, 1.0)
-        trim = (0.07, 0.08, 0.10, 1.0)
-        # dash slab and lower sill (the bottom edge of the view)
-        m.box((0.0, 1.05, -0.64), (2.6, 0.55, 0.12), frame)
-        m.box((0.0, 1.30, -0.575), (2.6, 0.05, 0.035), trim)
-        # slim canopy: pillars and a roof bow at the edges of the view
-        for side in (-1.0, 1.0):
-            pillar = _Mesh("deep-space-pillar")
-            pillar.box((0.0, 0.0, 0.0), (0.028, 0.028, 1.30), frame)
-            pnp = root.attachNewNode(pillar.node().node())
-            pnp.setPos(side * 1.06, 1.25, -0.02)   # at the view edge with the 82 degree FOV
-        m.box((0.0, 1.25, 0.64), (2.2, 0.03, 0.03), frame)
-        frame_np = root.attachNewNode(m.node().node())
-        holo = LineSegs("deep-space-cockpit-holo")
-        holo.setThickness(1.2 * self.line_scale)
-        holo.setColor(*HUD_CYAN, 0.55)
-        # two dash screens, outlined, tilted toward the pilot
+        y = self.CANOPY_Y
+        hx, hz = self.WINDOW_HALF
+        cz = self.WINDOW_CENTRE_Z
+        ox, oz = self.OUTER_HALF
+        inner = self._octagon(hx, hz, cz)
+        outer = self._octagon(ox * 1.25, oz * 1.25, cz)
+        # --- tinted outer glass: one panel between each window edge and the outer octagon
+        glass = _Mesh("deep-space-canopy-glass")
+        for k in range(8):
+            (ax, az), (bx, bz) = inner[k], inner[(k + 1) % 8]
+            (cx_, cz_), (dx_, dz_) = outer[(k + 1) % 8], outer[k]
+            shade = 0.85 + 0.15 * math.sin(k * 0.9)
+            glass.quad((ax, y, az), (bx, y, bz), (cx_, y + 0.05, cz_), (dx_, y + 0.05, dz_), (shade, shade, shade, 0.10))
+        self.cockpit_glass = root.attachNewNode(glass.node().node())
+        self.cockpit_glass.setTransparency(TransparencyAttrib.MAlpha)
+        self.cockpit_glass.setDepthWrite(False)
+        self.cockpit_glass.setTwoSided(True)
+        # --- hull: window frame bars, struts from each window corner outward, dash
+        hull = _Mesh("deep-space-canopy-hull")
+
+        def bar(p0, p1, width, depth_y, grey):
+            dx, dz = p1[0] - p0[0], p1[1] - p0[1]
+            ln = math.hypot(dx, dz) or 1.0
+            nx, nz = -dz / ln * width, dx / ln * width
+            col = (grey, grey, grey, 1.0)
+            hull.quad((p0[0] - nx, depth_y, p0[1] - nz), (p1[0] - nx, depth_y, p1[1] - nz),
+                      (p1[0] + nx, depth_y, p1[1] + nz), (p0[0] + nx, depth_y, p0[1] + nz), col)
+
+        for k in range(8):
+            bar(inner[k], inner[(k + 1) % 8], 0.020, y - 0.01, 0.95)          # window frame
+            bar(inner[k], outer[k], 0.016 if k % 2 else 0.026, y + 0.02, 0.80)  # struts
+        hull.box((0.0, 1.05, -0.66), (2.8, 0.55, 0.12), (0.70, 0.70, 0.70, 1.0))     # dash slab
+        hull.box((0.0, 1.30, -0.595), (2.8, 0.05, 0.035), (0.95, 0.95, 0.95, 1.0))   # dash lip
+        self.cockpit_hull = root.attachNewNode(hull.node().node())
+        self.cockpit_hull.setTwoSided(True)
+        # --- trim: glowing line around the clear window and the dash screens
+        trim = LineSegs("deep-space-canopy-trim")
+        trim.setThickness(1.4 * self.line_scale)
+        trim.setColor(1, 1, 1, 0.75)
+        for k in range(9):
+            px, pz = inner[k % 8]
+            (trim.moveTo if k == 0 else trim.drawTo)(px * 0.985, y - 0.02, pz * 0.985 + cz * 0.015)
+        trim.setColor(1, 1, 1, 0.55)
         for x0 in (-0.85, 0.35):
-            holo.moveTo(x0, 0.95, -0.555)
-            for x, y, z in ((x0 + 0.5, 0.95, -0.555), (x0 + 0.5, 1.10, -0.47), (x0, 1.10, -0.47), (x0, 0.95, -0.555)):
-                holo.drawTo(x, y, z)
-        holo.setColor(*HUD_AMBER, 0.45)
-        holo.moveTo(-0.97, 1.24, -0.62)
-        holo.drawTo(-0.97, 1.24, 0.40)
-        holo.moveTo(0.97, 1.24, -0.62)
-        holo.drawTo(0.97, 1.24, 0.40)
-        holo_np = root.attachNewNode(holo.create())
-        holo_np.setTransparency(TransparencyAttrib.MAlpha)
+            trim.moveTo(x0, 0.95, -0.575)
+            for px, py, pz in ((x0 + 0.5, 0.95, -0.575), (x0 + 0.5, 1.10, -0.49), (x0, 1.10, -0.49), (x0, 0.95, -0.575)):
+                trim.drawTo(px, py, pz)
+        self.cockpit_trim = root.attachNewNode(trim.create())
+        self.cockpit_trim.setTransparency(TransparencyAttrib.MAlpha)
+        self.cockpit_trim.setDepthWrite(False)
         root.setLightOff(1)
         root.setFogOff(1)
         root.setShaderOff(10)
         root.setBin("fixed", 30)
         root.setDepthOffset(1)
         self.cockpit = root
-        self.cockpit_frame = frame_np
+        self.cockpit_frame = self.cockpit_hull
+        self._apply_cockpit_theme(self.theme_index, announce=False)
         root.hide()
+
+    def _apply_cockpit_theme(self, index: int, announce: bool = True) -> None:
+        themes = self.COCKPIT_THEMES
+        self.theme_index = int(index) % len(themes)
+        theme = themes[self.theme_index]
+        if getattr(self, "cockpit_hull", None) is None:
+            return
+        self.cockpit_hull.setColorScale(*theme["hull"], 1.0)
+        self.cockpit_glass.setColorScale(*theme["glass"], 1.0)
+        self.cockpit_trim.setColorScale(*theme["trim"], 1.0)
+        if announce:
+            self.flash(f"COCKPIT  //  {theme['name']}", 1.4)
 
     def _build_hud(self) -> None:
         from direct.gui.OnscreenText import OnscreenText
@@ -801,7 +876,9 @@ class DeepSpaceFlight:
             self.flight_assist = True
             self.mode = "normal"
             self.charge = 0.0
-            self.boost_left = self.boost_cooldown = 0.0
+            self.boosting = False
+            self.boost_energy = 1.0
+            self.boost_idle = 0.0
             # Face Dyson Prime, a little off-centre so the first view shows it
             # beside the canopy frame rather than behind the reticle.
             look = Vec3(self.dyson_dir)
@@ -849,6 +926,8 @@ class DeepSpaceFlight:
                     pass
             self.local_root.hide()
             self.cockpit.hide()
+            if getattr(self, "laser_np", None) is not None:
+                self.laser_np.hide()
             self.hud.hide()
             self.throttle_root.hide()
         self._restore_world()
@@ -992,13 +1071,25 @@ class DeepSpaceFlight:
         if abs(self.throttle) < 0.02 and throttle_in == 0.0:
             self.throttle = 0.0
 
-        # Boost (normal space only)
-        self.boost_cooldown = max(0.0, self.boost_cooldown - dt)
-        self.boost_left = max(0.0, self.boost_left - dt)
-        if shift and self.mode == "normal" and self.boost_left <= 0.0 and self.boost_cooldown <= 0.0:
-            self.boost_left = BOOST_TIME
-            self.boost_cooldown = BOOST_TIME + BOOST_COOLDOWN
-            self.shake = max(self.shake, 0.35)
+        # Boost (normal space only): held Shift, limited by boost energy
+        was_boosting = self.boosting
+        self.boosting = bool(shift and self.mode == "normal" and self.boost_energy > 0.0)
+        if self.boosting:
+            self.boost_energy = max(0.0, self.boost_energy - BOOST_DRAIN * dt)
+            self.boost_idle = 0.0
+            if not was_boosting:
+                self.shake = max(self.shake, 0.30)
+        else:
+            self.boost_idle += dt
+            if self.boost_idle >= BOOST_RECHARGE_DELAY:
+                self.boost_energy = min(1.0, self.boost_energy + BOOST_RECHARGE * dt)
+        if self._pressed("c", self._down("c")):
+            self._apply_cockpit_theme(self.theme_index + 1)
+        firing = self._down(MouseButton.one())
+        self.laser_cooldown = max(0.0, self.laser_cooldown - dt)
+        if firing and self.laser_cooldown <= 0.0 and self.mode == "normal" and not self._aiming_at_planet():
+            self.laser_cooldown = LASER_COOLDOWN
+            self._fire_laser()
 
         # Rotation
         turn = SC_TURN_SCALE if self.mode == "supercruise" else 1.0
@@ -1030,18 +1121,18 @@ class DeepSpaceFlight:
             speed += (want - speed) * min(1.0, SC_RESPONSE * dt)
             self.vel = fwd * speed
         else:
-            vmax = MAX_SPEED * (BOOST_MULT if self.boost_left > 0.0 else 1.0)
+            vmax = MAX_SPEED * (BOOST_MULT if self.boosting else 1.0)
             desired = fwd * (self.throttle * vmax) + right * (lateral * THRUSTER_SPEED) + up * (vertical * THRUSTER_SPEED)
             if self.flight_assist:
                 delta = desired - self.vel
-                step = (ACCEL * (1.6 if self.boost_left > 0.0 else 1.0)) * dt
+                step = (ACCEL * (1.6 if self.boosting else 1.0)) * dt
                 if delta.length() > step:
                     delta.normalize()
                     delta *= step
                 self.vel = self.vel + delta
             else:
                 thrust = fwd * self.throttle + right * lateral * 0.6 + up * vertical * 0.6
-                self.vel = self.vel + thrust * (FA_OFF_ACCEL * (1.6 if self.boost_left > 0.0 else 1.0) * dt)
+                self.vel = self.vel + thrust * (FA_OFF_ACCEL * (1.6 if self.boosting else 1.0) * dt)
                 cap = vmax * 1.15
                 if self.vel.length() > cap:
                     self.vel.normalize()
@@ -1149,12 +1240,24 @@ class DeepSpaceFlight:
             while builds > 0 and self.cell_queue:
                 self._build_cell(self.cell_queue.pop(0))
                 builds -= 1
-        for key, cell in self.cells.items():
-            node = cell["node"]
-            ox, oy, oz = key[0] * CELL_SIZE, key[1] * CELL_SIZE, key[2] * CELL_SIZE
-            node.setPos(self.anchor.x + ox - self.pos[0], self.anchor.y + oy - self.pos[1], self.anchor.z + oz - self.pos[2])
-            for beacon in cell.get("blinks", ()):
-                beacon.setAlphaScale(0.25 + 0.75 * (1.0 if (self.frames // 20) % 3 == 0 else 0.0))
+        # Pass 282.75 (performance): the cell root moves once per frame; each cell sits at a
+        # small fixed offset from the centre cell (re-set only when the centre changes), so
+        # float precision holds however far the ship flies.  Fades refresh every 3rd frame.
+        centre = self.cell_centre or (0, 0, 0)
+        self.cells_root.setPos(self.anchor.x + centre[0] * CELL_SIZE - self.pos[0],
+                               self.anchor.y + centre[1] * CELL_SIZE - self.pos[1],
+                               self.anchor.z + centre[2] * CELL_SIZE - self.pos[2])
+        self._fade_dt = getattr(self, "_fade_dt", 0.0) + dt
+        if self.frames % 3 == 0:
+            fade_dt, self._fade_dt = self._fade_dt, 0.0
+            blink_on = (self.frames // 20) % 3 == 0
+            for cell in self.cells.values():
+                if cell["node"] is None:
+                    continue
+                self._fade_cell(cell, fade_dt)
+                for beacon in cell.get("blinks", ()):
+                    beacon.setAlphaScale(0.25 + 0.75 * (1.0 if blink_on else 0.0))
+        self._update_bursts(dt)
 
     def dyson_distance_au(self) -> float:
         gap = DYSON_START_AU - DYSON_FLOOR_AU
@@ -1174,7 +1277,7 @@ class DeepSpaceFlight:
     # ------------------------------------------------------------------
     def _clear_cells(self) -> None:
         for cell in self.cells.values():
-            if not cell["node"].isEmpty():
+            if cell["node"] is not None and not cell["node"].isEmpty():
                 cell["node"].removeNode()
         self.cells = {}
         self.cell_queue = []
@@ -1194,30 +1297,210 @@ class DeepSpaceFlight:
         for key in list(self.cells):
             if key not in want:
                 node = self.cells.pop(key)["node"]
-                if not node.isEmpty():
+                if node is not None and not node.isEmpty():
                     node.removeNode()
         self.cell_queue = sorted((k for k in want if k not in self.cells),
                                  key=lambda k: (k[0] - centre[0]) ** 2 + (k[1] - centre[1]) ** 2 + (k[2] - centre[2]) ** 2)
+        for key, cell in self.cells.items():
+            self._place_cell_node(key, cell)
         if force:
             for _ in range(min(len(self.cell_queue), 27)):
-                self._build_cell(self.cell_queue.pop(0))
+                self._build_cell(self.cell_queue.pop(0), fade_in=False)
         self._refresh_rocks_near()
 
     def _refresh_rocks_near(self) -> None:
+        """Collision candidates: only the cells right around the ship (performance)."""
         rocks = []
-        for cell in self.cells.values():
-            rocks.extend(cell["rocks"])
+        centre = self.cell_centre
+        for key, cell in self.cells.items():
+            if centre is not None and max(abs(key[0] - centre[0]), abs(key[1] - centre[1]), abs(key[2] - centre[2])) > COLLIDE_CELL_RADIUS:
+                continue
+            rocks.extend(r[:4] for r in cell["rocks"])
         self.rocks_near = rocks
+
+    def _place_cell_node(self, key, cell) -> None:
+        node = cell["node"]
+        if node is None:
+            return
+        centre = self.cell_centre or (0, 0, 0)
+        node.setPos((key[0] - centre[0]) * CELL_SIZE, (key[1] - centre[1]) * CELL_SIZE, (key[2] - centre[2]) * CELL_SIZE)
+
+    def _fade_cell(self, cell, dt: float) -> None:
+        """Fields fade in with distance and when first streamed, instead of popping in.
+
+        A fully visible field drops its transparency again so it draws as plain opaque rock."""
+        node = cell["node"]
+        if node is None:
+            return
+        cell["age"] = cell.get("age", 0.0) + dt
+        alpha = min(1.0, cell["age"] / FIELD_FADE_IN_TIME)
+        centre = cell.get("centre")
+        if centre is not None:
+            dx, dy, dz = centre[0] - self.pos[0], centre[1] - self.pos[1], centre[2] - self.pos[2]
+            d = math.sqrt(dx * dx + dy * dy + dz * dz)
+            alpha = min(alpha, max(0.0, min(1.0, (FIELD_FADE_FAR - d) / (FIELD_FADE_FAR - FIELD_FADE_NEAR))))
+        alpha = round(alpha, 2)
+        if alpha == cell.get("alpha"):
+            return
+        cell["alpha"] = alpha
+        if alpha <= 0.0:
+            node.hide()
+        elif alpha >= 1.0:
+            node.show()
+            node.clearTransparency()
+            node.clearColorScale()
+            node.clearBin()
+        else:
+            node.show()
+            node.setTransparency(TransparencyAttrib.MAlpha)
+            node.setAlphaScale(alpha)
+            node.setBin("transparent", 2)
+
+    # ------------------------------------------------------------------
+    # Weapon: left click fires at asteroids
+    # ------------------------------------------------------------------
+    def _aiming_at_planet(self) -> bool:
+        planets = getattr(self, "planets", None)
+        try:
+            return planets is not None and planets.aimed_planet() is not None
+        except Exception:
+            return False
+
+    def _fire_laser(self) -> None:
+        q = self.ship.getQuat()
+        fwd = q.getForward()
+        sx, sy, sz = self.pos
+        best = None
+        for key, cell in self.cells.items():
+            if cell["node"] is None or not cell["rocks"]:
+                continue
+            centre = cell.get("centre")
+            if centre is not None:
+                cdx, cdy, cdz = centre[0] - sx, centre[1] - sy, centre[2] - sz
+                if cdx * cdx + cdy * cdy + cdz * cdz > (LASER_RANGE + 2500.0) ** 2:
+                    continue
+            for rock in cell["rocks"]:
+                cx, cy, cz, r, idx = rock
+                if idx is None:
+                    continue                       # nav beacons are not targets
+                ox, oy, oz = cx - sx, cy - sy, cz - sz
+                t = ox * fwd.x + oy * fwd.y + oz * fwd.z
+                if t <= 0.0 or t > LASER_RANGE + r:
+                    continue
+                miss2 = (ox * ox + oy * oy + oz * oz) - t * t
+                rr = r * 1.05
+                if miss2 > rr * rr:
+                    continue
+                hit_t = t - math.sqrt(max(0.0, rr * rr - miss2))
+                if best is None or hit_t < best[0]:
+                    best = (hit_t, cell, rock)
+        length = LASER_RANGE if best is None else max(5.0, best[0])
+        self._show_laser(length)
+        if best is None:
+            return
+        _t, cell, rock = best
+        cx, cy, cz, r, idx = rock
+        self.destroyed.add((cell["key"], idx))
+        self.rocks_destroyed += 1
+        self._rebuild_cluster_mesh(cell)
+        self._refresh_rocks_near()
+        self._spawn_burst((cx, cy, cz), r)
+        self.shake = max(self.shake, min(0.45, 0.10 + r / 260.0))
+
+    def _build_weapon_fx(self) -> None:
+        self.laser_np = self.app.camera.attachNewNode("deep-space-laser")
+        self.laser_np.setLightOff(1)
+        self.laser_np.setFogOff(1)
+        self.laser_np.setShaderOff(10)
+        self.laser_np.setTransparency(TransparencyAttrib.MAlpha)
+        self.laser_np.setDepthWrite(False)
+        self.laser_np.setAttrib(ColorBlendAttrib.make(ColorBlendAttrib.MAdd, ColorBlendAttrib.OIncomingAlpha, ColorBlendAttrib.OOne))
+        self.laser_np.setBin("fixed", 29)
+        self.laser_np.hide()
+        self.burst_tex = _radial_texture("deep-space-burst", 64, 1.8, core=0.25)
+        self.burst_root = self.local_root.attachNewNode("deep-space-bursts")
+        self.burst_root.setLightOff(1)
+        self.burst_root.setDepthWrite(False)
+        self.burst_root.setTransparency(TransparencyAttrib.MAlpha)
+        self.burst_root.setAttrib(ColorBlendAttrib.make(ColorBlendAttrib.MAdd, ColorBlendAttrib.OIncomingAlpha, ColorBlendAttrib.OOne))
+        self.burst_root.setBin("transparent", 6)
+
+    def _show_laser(self, length: float) -> None:
+        """Twin beams from the dash guns to the hit point (or the weapon's range) straight ahead."""
+        if getattr(self, "laser_np", None) is None:
+            return
+        self.laser_np.getChildren().detach()
+        beam = LineSegs("deep-space-laser-beam")
+        beam.setThickness(2.4 * self.line_scale)
+        for side in (-1.0, 1.0):
+            beam.setColor(1.0, 0.35, 0.30, 0.95)
+            beam.moveTo(side * 0.55, 0.9, -0.42)
+            beam.setColor(1.0, 0.70, 0.50, 0.45)
+            beam.drawTo(0.0, max(2.0, length), 0.0)
+        self.laser_np.attachNewNode(beam.create())
+        self.laser_np.show()
+        self.laser_time = LASER_SHOW_TIME
+
+    def _spawn_burst(self, pos, radius: float) -> None:
+        holder = self.burst_root.attachNewNode("deep-space-burst")
+        flash = _billboard(holder, "deep-space-burst-flash", self.burst_tex, 1.0, (1.0, 0.62, 0.34, 1.0), (0, 0, 0))
+        rng = Random(int(pos[0] * 7 + pos[1] * 13 + pos[2] * 17) & 0xFFFFFF)
+        pts, cols, vels = [], [], []
+        for _ in range(28):
+            v = Vec3(rng.uniform(-1, 1), rng.uniform(-1, 1), rng.uniform(-1, 1))
+            if v.lengthSquared() < 1e-4:
+                v = Vec3(0, 0, 1)
+            v.normalize()
+            vels.append(v)
+            k = rng.uniform(0.25, 1.0)
+            pts.append((v.x * k, v.y * k, v.z * k))
+            g = rng.uniform(0.35, 0.6)
+            cols.append((g + 0.2, g, g * 0.85, 1.0))
+        debris = holder.attachNewNode(_points_node("deep-space-burst-debris", pts, cols).node())
+        debris.setRenderModeThickness(3.0 * self.line_scale)
+        self.bursts.append({"holder": holder, "flash": flash, "debris": debris, "pos": pos, "r": max(8.0, radius), "t": 0.0})
+
+    def _update_bursts(self, dt: float) -> None:
+        if getattr(self, "laser_np", None) is not None and self.laser_time > 0.0:
+            self.laser_time = max(0.0, self.laser_time - dt)
+            self.laser_np.setAlphaScale(self.laser_time / LASER_SHOW_TIME)
+            if self.laser_time <= 0.0:
+                self.laser_np.hide()
+        keep = []
+        for b in self.bursts:
+            b["t"] += dt
+            k = b["t"] / BURST_TIME
+            holder = b["holder"]
+            if k >= 1.0 or holder.isEmpty():
+                if not holder.isEmpty():
+                    holder.removeNode()
+                continue
+            px, py, pz = b["pos"]
+            holder.setPos(self.anchor.x + px - self.pos[0], self.anchor.y + py - self.pos[1], self.anchor.z + pz - self.pos[2])
+            b["flash"].setScale(b["r"] * (1.2 + 2.6 * k))
+            b["debris"].setScale(b["r"] * (0.4 + 3.2 * k))
+            holder.setAlphaScale(max(0.0, 1.0 - k) ** 1.4)
+            keep.append(b)
+        self.bursts = keep
 
     @staticmethod
     def _cell_seed(key) -> int:
         return ((key[0] * 73856093) ^ (key[1] * 19349663) ^ (key[2] * 83492791) ^ 0x5A5E) & 0xFFFFFFFF
 
-    def _build_cell(self, key) -> None:
+    def _build_cell(self, key, fade_in: bool = True) -> None:
         rng = Random(self._cell_seed(key))
-        node = self.cells_root.attachNewNode(f"deep-space-cell-{key[0]}_{key[1]}_{key[2]}")
-        cell = {"node": node, "rocks": [], "blinks": []}
         spawn_cell = key == (0, 0, 0)
+        has_cluster = spawn_cell or rng.random() < CLUSTER_CHANCE
+        rng = Random(self._cell_seed(key))       # replay the same draws as before this pass
+        cell = {"node": None, "rocks": [], "blinks": [], "key": key, "age": 0.0 if fade_in else FIELD_FADE_IN_TIME,
+                "alpha": None, "centre": None, "cluster_np": None, "cluster_specs": []}
+        probe = Random(self._cell_seed(key))
+        probe.random()
+        if not has_cluster and not (probe.random() < BEACON_CHANCE):
+            self.cells[key] = cell                 # empty space: no node at all
+            return
+        node = self.cells_root.attachNewNode(f"deep-space-cell-{key[0]}_{key[1]}_{key[2]}")
+        cell["node"] = node
         ox, oy, oz = key[0] * CELL_SIZE, key[1] * CELL_SIZE, key[2] * CELL_SIZE
         if spawn_cell or rng.random() < CLUSTER_CHANCE:
             if spawn_cell:
@@ -1227,6 +1510,7 @@ class DeepSpaceFlight:
             else:
                 centre = (rng.uniform(300, CELL_SIZE - 300), rng.uniform(300, CELL_SIZE - 300), rng.uniform(300, CELL_SIZE - 300))
             self._build_cluster(node, cell, rng, centre, (ox, oy, oz), dense=spawn_cell)
+            cell["centre"] = (ox + centre[0], oy + centre[1], oz + centre[2])
         if spawn_cell or rng.random() < BEACON_CHANCE:
             if spawn_cell:
                 b = self.dyson_dir * 520.0 + Vec3(-90.0, 0.0, 40.0)
@@ -1234,38 +1518,50 @@ class DeepSpaceFlight:
             else:
                 bpos = (rng.uniform(200, CELL_SIZE - 200), rng.uniform(200, CELL_SIZE - 200), rng.uniform(200, CELL_SIZE - 200))
             self._build_beacon(node, cell, bpos, (ox, oy, oz), rng)
+            if cell["centre"] is None:
+                cell["centre"] = (ox + bpos[0], oy + bpos[1], oz + bpos[2])
         self.cells[key] = cell
+        self._place_cell_node(key, cell)
+        self._fade_cell(cell, 0.0)
         self._refresh_rocks_near()
 
     def _build_cluster(self, parent, cell, rng: Random, centre, origin, dense: bool = False) -> None:
-        mesh = _Mesh("deep-space-asteroids", normals=True)
-        tags = LineSegs("deep-space-asteroid-tags")
-        tags.setThickness(1.2 * self.line_scale)
+        """One merged mesh per field (one draw call).  Pass 282.75: each rock keeps its own
+        shape seed so a shot rock can be removed by rebuilding just this field's mesh, and the
+        cyan survey ring that circled the biggest rock is gone."""
         count = rng.randint(12, 18) if dense else rng.randint(5, 12)
         spread = rng.uniform(380.0, 760.0)
-        biggest = None
-        for _ in range(count):
+        specs = []
+        for idx in range(count):
             r = rng.uniform(6.0, 28.0) if rng.random() < 0.8 else rng.uniform(40.0, 120.0)
             p = (centre[0] + rng.gauss(0, spread), centre[1] + rng.gauss(0, spread), centre[2] + rng.gauss(0, spread * 0.5))
-            self._rock(mesh, rng, p, r)
-            cell["rocks"].append((origin[0] + p[0], origin[1] + p[1], origin[2] + p[2], r * 0.9))
-            if biggest is None or r > biggest[1]:
-                biggest = (p, r)
-        rock_np = parent.attachNewNode(mesh.node().node())
-        rock_np.setTwoSided(False)
-        if biggest is not None:
-            # holo survey ring around the largest rock
-            (px, py, pz), r = biggest
-            tags.setColor(*HUD_CYAN, 0.55)
-            rr = r * 1.6
-            for k in range(49):
-                a = math.tau * k / 48
-                (tags.moveTo if k == 0 else tags.drawTo)(px + math.cos(a) * rr, py + math.sin(a) * rr, pz)
-            tag_np = parent.attachNewNode(tags.create())
-            tag_np.setLightOff(1)
-            tag_np.setTransparency(TransparencyAttrib.MAlpha)
-            tag_np.setAttrib(ColorBlendAttrib.make(ColorBlendAttrib.MAdd, ColorBlendAttrib.OIncomingAlpha, ColorBlendAttrib.OOne))
-            tag_np.setDepthWrite(False)
+            specs.append((idx, p, r, rng.getrandbits(32)))
+        cell["cluster_specs"] = specs
+        cell["cluster_origin"] = origin
+        self._rebuild_cluster_mesh(cell, parent)
+
+    def _rebuild_cluster_mesh(self, cell, parent=None) -> None:
+        parent = parent if parent is not None else cell["node"]
+        old = cell.get("cluster_np")
+        if old is not None and not old.isEmpty():
+            old.removeNode()
+        cell["cluster_np"] = None
+        origin = cell.get("cluster_origin", (0.0, 0.0, 0.0))
+        key = cell.get("key")
+        beacons = [r for r in cell["rocks"] if r[4] is None]
+        cell["rocks"] = beacons
+        mesh = _Mesh("deep-space-asteroids", normals=True)
+        live = 0
+        for idx, p, r, shape_seed in cell.get("cluster_specs", ()):
+            if (key, idx) in self.destroyed:
+                continue
+            self._rock(mesh, Random(shape_seed), p, r)
+            cell["rocks"].append((origin[0] + p[0], origin[1] + p[1], origin[2] + p[2], r * 0.9, idx))
+            live += 1
+        if live:
+            rock_np = parent.attachNewNode(mesh.node().node())
+            rock_np.setTwoSided(False)
+            cell["cluster_np"] = rock_np
 
     @staticmethod
     def _rock(mesh: _Mesh, rng: Random, centre, radius: float) -> None:
@@ -1332,7 +1628,7 @@ class DeepSpaceFlight:
         blink.setLightOff(1)
         blink.setTransparency(TransparencyAttrib.MAlpha)
         cell["blinks"].append(blink)
-        cell["rocks"].append((origin[0] + px, origin[1] + py, origin[2] + pz, 24.0))
+        cell["rocks"].append((origin[0] + px, origin[1] + py, origin[2] + pz, 24.0, None))
 
     # ------------------------------------------------------------------
     # HUD
@@ -1350,7 +1646,7 @@ class DeepSpaceFlight:
             self.throttle_fill.setPos(bx0, 0, zero_z if h > 0 else zero_z + h)
             self.throttle_fill.setScale(bx1 - bx0, 1, abs(h))
             col = HUD_CYAN if h > 0 else HUD_RED
-            if self.boost_left > 0.0:
+            if self.boosting:
                 col = HUD_AMBER
             self.throttle_fill.setColor(*col, 0.75)
         self.throttle_text.setText(f"{int(round(self.throttle * 100))}%")
@@ -1364,10 +1660,10 @@ class DeepSpaceFlight:
             parts.append(f"FRAME SHIFT  {max(0.0, SC_CHARGE_TIME - self.charge):.1f}")
         elif self.mode == "supercruise":
             parts.append("SUPERCRUISE  //  J DROP")
-        if self.boost_left > 0.0:
+        if self.boosting:
             parts.append("BOOST")
-        elif self.boost_cooldown > 0.0 and self.mode == "normal":
-            parts.append("BOOST RECHARGING")
+        elif self.boost_energy < 0.999 and self.mode == "normal":
+            parts.append(f"BOOST {int(self.boost_energy * 100)}%")
         parts.append("FA ON" if self.flight_assist else "FA OFF")
         self.mode_text.setText("   //   ".join(parts))
         self.mode_text.setFg((*(HUD_RED if not self.flight_assist else HUD_AMBER), 0.95))
@@ -1418,6 +1714,9 @@ class DeepSpaceFlight:
             "dyson_panels": int(getattr(self, "dyson_panel_count", 0)),
             "cells": len(self.cells),
             "rocks_near": len(self.rocks_near),
+            "rocks_destroyed": int(self.rocks_destroyed),
+            "boost_energy": round(self.boost_energy, 3),
+            "cockpit_theme": self.COCKPIT_THEMES[self.theme_index]["name"],
             "dust_shader": bool(self.shader_ok),
             "hidden_world_nodes": len(self.hidden_scene),
         }
