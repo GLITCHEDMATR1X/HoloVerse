@@ -3962,6 +3962,8 @@ BOT_E_BESIDE_DISTANCE = 4.0        # Pass 282.62: E reaches a guide you stand be
 ARTIFACT_REACH = 14.0              # Pass 282.62: aim at an artifact from this far (the gateway arch is ~12.5 m away)
 ARTIFACT_AIM_RADIUS = 1.9          # ... when the crosshair passes this close to its column
 ARTIFACT_STAND_RADIUS = 3.0        # ... or stand on its pedestal and press E/click
+ARTIFACT_AIM_ABOVE_GLYPH = 3.5     # Pass 282.75: the aim column reaches this far above the glyph, so a
+                                   # level or slightly raised view counts (it stopped 1.6 m above, at eye height)
 
 # Pass 282.63: one UI palette for every screen (title, HUD, pause menu, guide
 # dialogue, Gleebs captions).  Dark glass panels, white text, cyan accents,
@@ -17682,9 +17684,13 @@ class CommandHubApp(ShowBase):
                     max_distance=ARTIFACT_LOOK_ACTIVATION_RADIUS, cone_cos=_HV263_MIN_FACING_DOT
                 )
                 if looked is not None:
-                    distance = float(self.artifact_activation_distance(looked))
-                    local_range = max(4.2, min(_HV263_MAX_ARTIFACT_DISTANCE, float(looked.get("radius", 3.6)) + 0.8))
-                    if distance <= local_range:
+                    # Pass 282.75: the prompt shows wherever E/click activates (the same reach
+                    # activate_focused_artifact uses).  It used to need ~4.5 m, so players walked
+                    # right up to the pedestal and had to look down at the floor to aim.
+                    base = looked.get("pedestal_pos", looked.get("pos"))
+                    origin = self.head_world_pos()
+                    distance = math.hypot(float(base.x - origin.x), float(base.y - origin.y))
+                    if distance <= ARTIFACT_REACH:
                         focused_artifact = looked
                         self.nearest_artifact = looked
                         self.nearest_artifact_dist = distance
@@ -19541,7 +19547,7 @@ def _hv263_find_looked_at_artifact(self, max_distance=7.0, cone_cos=0.92):
             horiz = math.hypot(hx, hy)
             if horiz > ARTIFACT_REACH:
                 continue
-            z0, z1 = float(base.z) - 0.2, float(glyph.z) + 1.6
+            z0, z1 = float(base.z) - 0.2, float(glyph.z) + ARTIFACT_AIM_ABOVE_GLYPH
             # Closest approach between the view ray and the column (a vertical segment).
             best_miss, best_t = 999.0, 0.0
             for k in range(13):
