@@ -6917,6 +6917,7 @@ class CommandHubApp(ShowBase):
         self.esc_hold_start = 0.0
         self.esc_hold_deadline = 0.0
         self._suspend_host_player_input_for_dimension()
+        self._install_native_key_mirror()
         # A saved Ember aircraft is global for the default HoloVerse world, but
         # it must not remain active or visually overlap a same-window dimension.
         try:
@@ -7131,6 +7132,7 @@ class CommandHubApp(ShowBase):
             pass
         host_update_alive = self._ensure_host_update_task_alive()
         host_input_ready = False
+        self._remove_native_key_mirror()
         try:
             host_input_ready = bool(self._restore_host_player_input_after_dimension())
         except Exception as exc:
@@ -7384,6 +7386,7 @@ class CommandHubApp(ShowBase):
             # silent and dormant until TAB returns to MatrixCore.
             self.native_mode_audio_profile = {"label": str(label or "MODE"), "source": "dimension_only_host_silent"}
             self.active_native_mode = mode_obj
+            self._log_native_input_diagnostics(label)
             self._pending_native_manifest = {}
             self.native_mode_entry = Path(entry)
             self.native_mode_label = label
@@ -11845,6 +11848,62 @@ class CommandHubApp(ShowBase):
         except Exception:
             pass
         self.native_host_input_suspended = True
+
+    _NATIVE_MIRROR_KEYS = ("w", "a", "s", "d", "shift", "space", "control",
+                           "arrow_left", "arrow_right", "arrow_up", "arrow_down")
+
+    def _install_native_key_mirror(self) -> None:
+        """Keep ``self.keys`` live for dimensions that read the host key map.
+
+        The suspend above unregisters set_key, so ``self.keys`` froze for the whole
+        dimension; an adapter that polls ``host.keys`` (as in-world dimensions do)
+        saw every movement key as released.  The mirror only records key state on
+        its own listener; it never triggers a host action.
+        """
+        self._remove_native_key_mirror()
+        try:
+            from direct.showbase.DirectObject import DirectObject
+            mirror = DirectObject()
+            for key in self._NATIVE_MIRROR_KEYS:
+                mirror.accept(key, self._native_mirror_key, [key, True])
+                mirror.accept(f"{key}-up", self._native_mirror_key, [key, False])
+            self._native_key_mirror = mirror
+        except Exception as exc:
+            self._native_key_mirror = None
+            print(f"native_key_mirror_failed err={exc.__class__.__name__}:{exc}")
+
+    def _native_mirror_key(self, key, value) -> None:
+        try:
+            self.keys[key] = bool(value)
+        except Exception:
+            pass
+
+    def _remove_native_key_mirror(self) -> None:
+        mirror = getattr(self, "_native_key_mirror", None)
+        self._native_key_mirror = None
+        if mirror is not None:
+            try:
+                mirror.ignoreAll()
+            except Exception:
+                pass
+        try:
+            self.keys.clear()
+        except Exception:
+            pass
+
+    def _log_native_input_diagnostics(self, label: str) -> None:
+        """One line per dimension entry: which controls are actually registered."""
+        try:
+            probe = ("w", "a", "s", "d", "space", "mouse1", "e", "escape", "tab")
+            state = " ".join(f"{k}={int(bool(self.isAccepting(k)))}" for k in probe)
+            props = self.win.getProperties() if self.win is not None else None
+            mouse = int(props.getMouseMode()) if props is not None and hasattr(props, "getMouseMode") else -1
+            focus = int(bool(props.getForeground())) if props is not None and hasattr(props, "getForeground") else -1
+            print(f"native_input_diag label={label} {state} mouse_mode={mouse} foreground={focus} "
+                  f"mouse_captured={int(bool(getattr(self, 'mouse_captured', False)))} "
+                  f"keys_mirror={int(getattr(self, '_native_key_mirror', None) is not None)}")
+        except Exception as exc:
+            print(f"native_input_diag_failed err={exc.__class__.__name__}:{exc}")
 
     def _restore_host_player_input_after_dimension(self) -> bool:
         """Rebuild the canonical Core controls after every native teardown.
