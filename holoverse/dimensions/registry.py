@@ -1966,6 +1966,11 @@ class DimensionRegistry:
             enter = getattr(native, "enter", None)
             if callable(enter):
                 enter()
+            # Pass 282.75: the same post-entry fix-ups as launch_native_mode (cursor for
+            # mouse-driven realities, key forwarding for host-input realities).
+            after_enter = getattr(self.host, "_after_native_mode_enter", None)
+            if callable(after_enter):
+                after_enter(native, label)
             refresh = getattr(self.host, "refresh_ui", None)
             if callable(refresh):
                 refresh()

@@ -7162,6 +7162,15 @@ class CommandHubApp(ShowBase):
         except Exception:
             pass
 
+    def _after_native_mode_enter(self, mode_obj, label: str = "") -> None:
+        """Host fix-ups once a same-window dimension has entered.
+
+        Every route that mounts a dimension calls this: launch_native_mode and the Dimension
+        Registry's own launch (Gleebs' archive, HoloSpace planets, guide bots).
+        """
+        self._apply_native_mode_cursor(mode_obj, label)
+        self._install_native_input_bridge(mode_obj, label)
+
     def _apply_native_mode_cursor(self, mode_obj, label: str = "") -> None:
         """Let a dimension that is driven by mouse clicks (menus, click-to-move) keep a cursor.
 
@@ -7170,7 +7179,9 @@ class CommandHubApp(ShowBase):
         cursor over their title menu.  A mode object may set ``requires_mouse_capture = False``.
         The cursor state is restored from native_saved_camera when the dimension returns.
         """
-        mouse_driven = canonical_dimension_lookup_key(label) in MOUSE_DRIVEN_NATIVE_DIMENSIONS
+        label_key = canonical_dimension_lookup_key(label)
+        # Registry launches label as "DIMENSION // <TITLE>", so match the name inside the label.
+        mouse_driven = any(key in label_key for key in MOUSE_DRIVEN_NATIVE_DIMENSIONS)
         if getattr(mode_obj, "requires_mouse_capture", True) is not False and not mouse_driven:
             return
         try:
@@ -7601,8 +7612,7 @@ class CommandHubApp(ShowBase):
             # silent and dormant until TAB returns to MatrixCore.
             self.native_mode_audio_profile = {"label": str(label or "MODE"), "source": "dimension_only_host_silent"}
             self.active_native_mode = mode_obj
-            self._apply_native_mode_cursor(mode_obj, label)
-            self._install_native_input_bridge(mode_obj, label)
+            self._after_native_mode_enter(mode_obj, label)
             self._pending_native_manifest = {}
             self.native_mode_entry = Path(entry)
             self.native_mode_label = label
@@ -12416,6 +12426,7 @@ class CommandHubApp(ShowBase):
             enter = getattr(native_mode, "enter", None)
             if callable(enter):
                 enter()
+            self._after_native_mode_enter(native_mode, label)
             if getattr(self, "center_hint", None) is not None:
                 self.center_hint["text"] = "HOLOMAP // M OR ESC RETURNS"
             try:
