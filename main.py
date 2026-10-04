@@ -6404,6 +6404,22 @@ class CommandHubApp(ShowBase):
         adapter = folder / adapter_name
         return adapter if adapter.exists() and adapter.is_file() else None
 
+    def _add_native_import_root(self, folder: Path) -> None:
+        root = os.fspath(Path(folder).resolve())
+        if root in sys.path:
+            return
+        sys.path.append(root)
+        self._native_import_root = root
+
+    def _remove_native_import_root(self) -> None:
+        root = getattr(self, "_native_import_root", None)
+        self._native_import_root = None
+        if root:
+            try:
+                sys.path.remove(root)
+            except ValueError:
+                pass
+
     def _load_native_mode_object(self, mode: dict, entry: Path | None, label: str):
         adapter_path = self._mode_adapter_path(mode)
         if adapter_path is None:
@@ -6414,6 +6430,10 @@ class CommandHubApp(ShowBase):
             raise ImportError(f"could not load adapter spec: {adapter_path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
+        # Adapters import their own packages (The Archivist: ``from archive3d.mode import ...``),
+        # so the project folder must be importable while the dimension is mounted.  Appended,
+        # never prepended, so a dimension module can never shadow one of HoloVerse's own.
+        self._add_native_import_root(Path(adapter_path).parent)
         try:
             spec.loader.exec_module(module)
         except Exception:
@@ -6978,6 +6998,111 @@ class CommandHubApp(ShowBase):
         print(f"native_host_dormancy_begin label={label} host_audio=stopped host_clock=frozen")
         print(f"native_mode_begin label={label}")
 
+    _NATIVE_BRIDGE_HELD = ("w", "a", "s", "d", "shift", "space", "control", "alt",
+                           "arrow_left", "arrow_right", "arrow_up", "arrow_down")
+    _NATIVE_BRIDGE_PRESS = ("mouse1", "mouse3", "e", "q", "r", "t", "v", "f", "g", "b", "n", "c",
+                            "i", "j", "k", "l", "u", "o", "p", "y", "z", "x", "h", "m", "enter",
+                            "wheel_up", "wheel_down", "[", "]",
+                            "f1", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12")
+    _NATIVE_BRIDGE_ACTION_NAMES = {"[": "bracket_left", "]": "bracket_right"}
+
+    @staticmethod
+    def _real_panda_messenger():
+        from direct.showbase import MessengerGlobal
+        current = MessengerGlobal.messenger
+        return getattr(current, "_real", current)
+
+    def _dimension_owns_key_input(self) -> bool:
+        """True when anything but HoloVerse itself listens for the movement / use keys."""
+        try:
+            panda_messenger = self._real_panda_messenger()
+        except Exception:
+            return True
+        for event in ("w", "a", "s", "d", "space", "e", "mouse1"):
+            try:
+                acceptors = panda_messenger.whoAccepts(event) or {}
+            except Exception:
+                return True
+            for entry in acceptors.values():
+                fn = entry[0] if isinstance(entry, (list, tuple)) else entry
+                if getattr(fn, "__self__", None) is not self:
+                    return True
+        return False
+
+    def _install_native_input_bridge(self, mode_obj, label: str = "") -> bool:
+        """Forward keys to dimensions built on the host-forwarded input contract.
+
+        Since Pass 282.16 HoloVerse unregisters its own controls when a dimension enters.
+        Dimensions that take their input from HoloVerse instead of registering keys
+        themselves (HoloUtopia: ``on_host_action``; Zonez: ``host.keys`` plus
+        ``on_host_action``) were left with no input at all.  The bridge is a separate
+        listener object, so HoloVerse's own handlers stay unregistered, and it is only
+        installed when the dimension has the hook and registered no keys of its own
+        (HoloCore, HoloShell and the Indigo Giant bind their keys directly).
+        """
+        self._remove_native_input_bridge()
+        handler = getattr(mode_obj, "on_host_action", None)
+        if not callable(handler) or self._dimension_owns_key_input():
+            return False
+        try:
+            from direct.showbase.DirectObject import DirectObject
+            bridge = DirectObject()
+            # Register on Panda's real messenger: HoloUtopia replaces the global messenger
+            # with a capturing proxy, which would swallow a plain DirectObject.accept().
+            real = self._real_panda_messenger()
+
+            def listen(event, method, extra):
+                real.accept(event, bridge, method, extra, 1)
+
+            for key in self._NATIVE_BRIDGE_HELD:
+                listen(key, self._native_bridge_held, [key, True])
+                listen(f"{key}-up", self._native_bridge_held, [key, False])
+            for key in self._NATIVE_BRIDGE_PRESS:
+                action = self._NATIVE_BRIDGE_ACTION_NAMES.get(key, key)
+                listen(key, self._native_bridge_action, [action])
+                if key in ("mouse1", "mouse3", "e", "q"):
+                    listen(f"{key}-up", self._native_bridge_action, [f"{action}_up"])
+            for number in range(10):
+                listen(str(number), self._native_bridge_action, [f"number_{number}"])
+            self._native_input_bridge = bridge
+            print(f"native_input_bridge label={label} installed=1")
+            return True
+        except Exception as exc:
+            self._native_input_bridge = None
+            print(f"native_input_bridge_failed label={label} err={exc.__class__.__name__}:{exc}")
+            return False
+
+    def _native_bridge_held(self, key: str, down: bool) -> None:
+        try:
+            self.keys[key] = bool(down)
+        except Exception:
+            pass
+        self._native_bridge_action(key if down else f"{key}_up")
+
+    def _native_bridge_action(self, action: str) -> None:
+        mode_obj = getattr(self, "active_native_mode", None)
+        handler = getattr(mode_obj, "on_host_action", None)
+        if not callable(handler):
+            return
+        try:
+            handler(action)
+        except Exception as exc:
+            print(f"native_input_bridge_action_error action={action} err={exc.__class__.__name__}:{exc}")
+
+    def _remove_native_input_bridge(self) -> None:
+        bridge = getattr(self, "_native_input_bridge", None)
+        self._native_input_bridge = None
+        if bridge is None:
+            return
+        try:
+            self._real_panda_messenger().ignoreAll(bridge)
+        except Exception:
+            pass
+        try:
+            self.keys.clear()
+        except Exception:
+            pass
+
     def _apply_native_mode_cursor(self, mode_obj, label: str = "") -> None:
         """Let a dimension that is driven by mouse clicks (menus, click-to-move) keep a cursor.
 
@@ -7150,6 +7275,11 @@ class CommandHubApp(ShowBase):
             pass
         try:
             self._unload_native_adapter_module()
+        except Exception:
+            pass
+        try:
+            self._remove_native_input_bridge()
+            self._remove_native_import_root()
         except Exception:
             pass
         host_update_alive = self._ensure_host_update_task_alive()
@@ -7408,6 +7538,7 @@ class CommandHubApp(ShowBase):
             self.native_mode_audio_profile = {"label": str(label or "MODE"), "source": "dimension_only_host_silent"}
             self.active_native_mode = mode_obj
             self._apply_native_mode_cursor(mode_obj, label)
+            self._install_native_input_bridge(mode_obj, label)
             self._pending_native_manifest = {}
             self.native_mode_entry = Path(entry)
             self.native_mode_label = label
