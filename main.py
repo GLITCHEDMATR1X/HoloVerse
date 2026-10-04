@@ -7676,6 +7676,18 @@ class CommandHubApp(ShowBase):
         except Exception:
             return 0
 
+    def _host_window_geometry(self) -> tuple[int, int, int, int]:
+        """HoloVerse's window origin and client size right now (falls back to the launch rect)."""
+        x, y = int(LAUNCH_X), int(LAUNCH_Y)
+        w, h = self._embedded_window_size()
+        try:
+            props = self.win.getProperties() if self.win is not None and hasattr(self.win, "getProperties") else None
+            if props is not None and props.hasOrigin() and not bool(getattr(props, "getMinimized", lambda: False)()):
+                x, y = int(props.getXOrigin()), int(props.getYOrigin())
+        except Exception:
+            pass
+        return x, y, w, h
+
     def _embedded_window_size(self) -> tuple[int, int]:
         try:
             if self.win is not None:
@@ -7887,17 +7899,22 @@ class CommandHubApp(ShowBase):
             env["MATRIX_SFX_VOLUME"] = str(payload["sfx_volume"])
             env["MATRIX_MUSIC_VOLUME"] = str(payload["music_volume"])
             env["MATRIX_AMBIENCE_VOLUME"] = str(payload["ambience_volume"])
-            env["MATRIX_GAME_WIDTH"] = str(launch_payload["width"])
-            env["MATRIX_GAME_HEIGHT"] = str(launch_payload["height"])
-            env["MATRIX_GAME_X"] = str(LAUNCH_X)
-            env["MATRIX_GAME_Y"] = str(LAUNCH_Y)
+            # Pass 282.75: a game in its own window takes HoloVerse's actual window geometry.
+            # launch_payload["width"/"height"] is the saved launch setting (1920x1080 by default),
+            # so on a larger display (HoloVerse sized to the monitor) Operation StarFall opened as a
+            # quarter-size window in the top-left corner.
+            host_x, host_y, host_w, host_h = self._host_window_geometry()
+            env["MATRIX_GAME_WIDTH"] = str(host_w)
+            env["MATRIX_GAME_HEIGHT"] = str(host_h)
+            env["MATRIX_GAME_X"] = str(host_x)
+            env["MATRIX_GAME_Y"] = str(host_y)
             env["HOLOVERSE_VIRTUAL_WIDTH"] = "1920"
             env["HOLOVERSE_VIRTUAL_HEIGHT"] = "1080"
             env["HOLOVERSE_FPS_CAP"] = str(launch_payload.get("fps_cap", 60) if isinstance(launch_payload, dict) else 60)
             env["HOLOVERSE_VSYNC"] = "1" if launch_payload.get("vsync", True) else "0"
             env["HOLOVERSE_UI_SCALE"] = str(launch_payload.get("ui_scale", 1.0))
-            env["MATRIX_GAME_FULLSCREEN"] = "1" if launch_payload["fullscreen"] else "0"
-            env["MATRIX_GAME_BORDERLESS"] = "1" if launch_payload["borderless"] else "0"
+            env["MATRIX_GAME_FULLSCREEN"] = "1" if (LAUNCH_FULLSCREEN and not LAUNCH_BORDERLESS) else "0"
+            env["MATRIX_GAME_BORDERLESS"] = "1" if LAUNCH_BORDERLESS else "0"
             env["MATRIX_GAME_BORDERED_FULLSCREEN"] = "1" if launch_payload.get("bordered_fullscreen", True) else "0"
             env["MATRIX_GAME_MOUSE_SENSITIVITY"] = str(launch_payload["mouse_sensitivity"])
             env["MATRIX_GAME_INVERT_Y"] = "1" if launch_payload["invert_y"] else "0"
