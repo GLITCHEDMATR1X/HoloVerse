@@ -17118,7 +17118,7 @@ class CommandHubApp(ShowBase):
                     "Roll:  A / D\n"
                     "Thrust:  Space / Ctrl, Left / Right\n"
                     "Boost:  hold Shift\n"
-                    "Fire at asteroids:  Left click\n"
+                    "Fire:  Left click (asteroid hits +5% shield)\n"
                     "Cockpit colours:  C\n"
                     "Flight assist:  Z\n"
                     "Supercruise:  J (again to drop)\n"

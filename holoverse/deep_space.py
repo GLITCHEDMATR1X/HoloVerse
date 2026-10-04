@@ -314,6 +314,13 @@ class DeepSpaceFlight:
         self.destroyed: set = set()                          # (cell key, rock index) shot this session
         self.rocks_destroyed = 0
         self.theme_index = 0
+        self.shield = 1.0                                     # Pass 282.76: 0..1
+        self.hull = 1.0
+        self.dead = False
+        self.dead_timer = 0.0
+        self.rock_hits: dict = {}                             # (cell key, rock index) -> hits taken
+        self.holo = None
+        self.combat = None
         self.mode = "normal"                                  # normal | charging | supercruise
         self.charge = 0.0
         self.approach = 0.0
@@ -384,6 +391,25 @@ class DeepSpaceFlight:
         self._build_cockpit()
         self._build_weapon_fx()
         self._build_hud()
+        try:
+            from holoverse.deep_space_holohud import HoloHUD
+            font = None
+            try:
+                font = app.load_core_ui_font()
+            except Exception:
+                font = None
+            self.holo = HoloHUD(app.camera, _Mesh, font, ls)
+            theme = self.COCKPIT_THEMES[self.theme_index]
+            self.holo.set_theme(theme["hud"], theme["hud_warn"])
+        except Exception as exc:
+            self.holo = None
+            print(f"deep_space_holohud_unavailable:{exc.__class__.__name__}:{exc}")
+        try:
+            from holoverse.deep_space_combat import DefenceWings
+            self.combat = DefenceWings(self, _Mesh, _radial_texture, _billboard)
+        except Exception as exc:
+            self.combat = None
+            print(f"deep_space_combat_unavailable:{exc.__class__.__name__}:{exc}")
         # Pass 282.64: the Dimension Archive's realities as distant planets.
         try:
             from holoverse.dimension_planets import DimensionPlanets
@@ -683,45 +709,50 @@ class DeepSpaceFlight:
             tile.instanceTo(holder)
             self.dust_tiles.append(holder)
 
-    # Pass 282.75: cockpit colour themes (C cycles them).  The octagonal window stays clear in
-    # every theme; the hull, the tinted outer glass and the trim take the theme colours.
-    COCKPIT_THEMES = (
-        {"name": "CYAN",    "hull": (0.10, 0.13, 0.17), "glass": (0.30, 0.75, 0.95), "trim": (0.40, 0.95, 1.00)},
-        {"name": "VIOLET",  "hull": (0.13, 0.09, 0.19), "glass": (0.62, 0.38, 0.95), "trim": (0.86, 0.48, 1.00)},
-        {"name": "AMBER",   "hull": (0.17, 0.12, 0.08), "glass": (0.95, 0.62, 0.28), "trim": (1.00, 0.72, 0.28)},
-        {"name": "EMERALD", "hull": (0.07, 0.15, 0.12), "glass": (0.30, 0.90, 0.62), "trim": (0.40, 1.00, 0.70)},
-    )
+    # Pass 282.75/282.76: the cockpit's colours and window design come from
+    # assets/config/holospace_cockpit.json (holoverse/holospace_cockpit_config.py); C cycles themes.
+    COCKPIT_THEMES: list = []           # filled from the config when the cockpit is built
     CANOPY_Y = 1.25                     # canopy plane distance in front of the eye (camera space)
-    WINDOW_HALF = (0.86, 0.47)          # half width / height of the clear octagon window
-    WINDOW_CENTRE_Z = 0.06
     OUTER_HALF = (1.55, 0.95)           # outer glass edge, past the screen edges at 82 degrees
 
-    def _octagon(self, half_x: float, half_z: float, cz: float):
-        pts = []
-        for k in range(8):
-            a = math.radians(22.5 + 45.0 * k)
-            pts.append((math.cos(a) / math.cos(math.radians(22.5)) * half_x, math.sin(a) / math.cos(math.radians(22.5)) * half_z + cz))
-        return pts
+    def _window_polygon(self, sides: int, half_x: float, half_z: float, cz: float):
+        """A regular N-gon with a flat top, stretched to half_x by half_z (8 = the octagon)."""
+        sides = max(6, int(sides))
+        step = 360.0 / sides
+        start = step * 0.5
+        k = 1.0 / math.cos(math.radians(step * 0.5))
+        return [(math.cos(math.radians(start + step * i)) * k * half_x,
+                 math.sin(math.radians(start + step * i)) * k * half_z + cz) for i in range(sides)]
 
     def _build_cockpit(self) -> None:
         """Octagonal canopy (Pass 282.75): a clear octagon window in a framed, tinted glass canopy.
 
         Everything is camera space and drawn in a late fixed bin, so it always sits in front of
         space.  Hull, glass and trim are built white/grey and coloured by the active theme."""
+        from holoverse.holospace_cockpit_config import load_config, load_theme_choice
+
+        cfg = load_config()
+        self.cockpit_config = cfg
+        self.COCKPIT_THEMES = cfg["themes"]
+        names = [t["name"] for t in self.COCKPIT_THEMES]
+        chosen = load_theme_choice() or cfg["default_theme"]
+        self.theme_index = names.index(chosen) if chosen in names else 0
+        win = cfg["window"]
+        sides = int(win["sides"])
         root = self.app.camera.attachNewNode("deep-space-cockpit")
         y = self.CANOPY_Y
-        hx, hz = self.WINDOW_HALF
-        cz = self.WINDOW_CENTRE_Z
+        hx, hz, cz = win["half_width"], win["half_height"], win["centre_z"]
         ox, oz = self.OUTER_HALF
-        inner = self._octagon(hx, hz, cz)
-        outer = self._octagon(ox * 1.25, oz * 1.25, cz)
-        # --- tinted outer glass: one panel between each window edge and the outer octagon
+        inner = self._window_polygon(sides, hx, hz, cz)
+        outer = self._window_polygon(sides, ox * 1.25, oz * 1.25, cz)
+        # --- tinted outer glass: one panel between each window edge and the outer polygon
         glass = _Mesh("deep-space-canopy-glass")
-        for k in range(8):
-            (ax, az), (bx, bz) = inner[k], inner[(k + 1) % 8]
-            (cx_, cz_), (dx_, dz_) = outer[(k + 1) % 8], outer[k]
+        glass_alpha = float(cfg["glass_alpha"])
+        for k in range(sides):
+            (ax, az), (bx, bz) = inner[k], inner[(k + 1) % sides]
+            (cx_, cz_), (dx_, dz_) = outer[(k + 1) % sides], outer[k]
             shade = 0.85 + 0.15 * math.sin(k * 0.9)
-            glass.quad((ax, y, az), (bx, y, bz), (cx_, y + 0.05, cz_), (dx_, y + 0.05, dz_), (shade, shade, shade, 0.10))
+            glass.quad((ax, y, az), (bx, y, bz), (cx_, y + 0.05, cz_), (dx_, y + 0.05, dz_), (shade, shade, shade, glass_alpha))
         self.cockpit_glass = root.attachNewNode(glass.node().node())
         self.cockpit_glass.setTransparency(TransparencyAttrib.MAlpha)
         self.cockpit_glass.setDepthWrite(False)
@@ -737,9 +768,10 @@ class DeepSpaceFlight:
             hull.quad((p0[0] - nx, depth_y, p0[1] - nz), (p1[0] - nx, depth_y, p1[1] - nz),
                       (p1[0] + nx, depth_y, p1[1] + nz), (p0[0] + nx, depth_y, p0[1] + nz), col)
 
-        for k in range(8):
-            bar(inner[k], inner[(k + 1) % 8], 0.020, y - 0.01, 0.95)          # window frame
-            bar(inner[k], outer[k], 0.016 if k % 2 else 0.026, y + 0.02, 0.80)  # struts
+        for k in range(sides):
+            bar(inner[k], inner[(k + 1) % sides], win["frame_width"], y - 0.01, 0.95)    # window frame
+            if cfg["struts"]:
+                bar(inner[k], outer[k], win["strut_width"] * (0.7 if k % 2 else 1.15), y + 0.02, 0.80)
         hull.box((0.0, 1.05, -0.66), (2.8, 0.55, 0.12), (0.70, 0.70, 0.70, 1.0))     # dash slab
         hull.box((0.0, 1.30, -0.595), (2.8, 0.05, 0.035), (0.95, 0.95, 0.95, 1.0))   # dash lip
         self.cockpit_hull = root.attachNewNode(hull.node().node())
@@ -748,8 +780,8 @@ class DeepSpaceFlight:
         trim = LineSegs("deep-space-canopy-trim")
         trim.setThickness(1.4 * self.line_scale)
         trim.setColor(1, 1, 1, 0.75)
-        for k in range(9):
-            px, pz = inner[k % 8]
+        for k in range(sides + 1):
+            px, pz = inner[k % sides]
             (trim.moveTo if k == 0 else trim.drawTo)(px * 0.985, y - 0.02, pz * 0.985 + cz * 0.015)
         trim.setColor(1, 1, 1, 0.55)
         for x0 in (-0.85, 0.35):
@@ -778,8 +810,16 @@ class DeepSpaceFlight:
         self.cockpit_hull.setColorScale(*theme["hull"], 1.0)
         self.cockpit_glass.setColorScale(*theme["glass"], 1.0)
         self.cockpit_trim.setColorScale(*theme["trim"], 1.0)
+        holo = getattr(self, "holo", None)
+        if holo is not None:
+            holo.set_theme(theme["hud"], theme["hud_warn"])
         if announce:
             self.flash(f"COCKPIT  //  {theme['name']}", 1.4)
+            try:
+                from holoverse.holospace_cockpit_config import save_theme_choice
+                save_theme_choice(theme["name"])
+            except Exception:
+                pass
 
     def _build_hud(self) -> None:
         from direct.gui.OnscreenText import OnscreenText
@@ -879,6 +919,12 @@ class DeepSpaceFlight:
             self.boosting = False
             self.boost_energy = 1.0
             self.boost_idle = 0.0
+            self.shield = 1.0
+            self.hull = 1.0
+            self.dead = False
+            self.dead_timer = 0.0
+            if self.combat is not None:
+                self.combat.clear(reset_zones=True)
             # Face Dyson Prime, a little off-centre so the first view shows it
             # beside the canopy frame rather than behind the reticle.
             look = Vec3(self.dyson_dir)
@@ -901,7 +947,13 @@ class DeepSpaceFlight:
         self.local_root.show()
         self.cockpit.show()
         self.hud.show()
-        self.throttle_root.show()
+        # Pass 282.76: the flight readouts live on the holographic cockpit panels now; the flat
+        # screen keeps only the reticle, stick marker and the Dyson Prime edge arrow.
+        for flat in (self.speed_text, self.mode_text, self.msg_text, self.title_text):
+            flat.hide()
+        self.throttle_root.hide()
+        if self.holo is not None:
+            self.holo.show()
         try:
             app.camLens.setNearFar(0.05, 20000.0)
         except Exception:
@@ -928,6 +980,10 @@ class DeepSpaceFlight:
             self.cockpit.hide()
             if getattr(self, "laser_np", None) is not None:
                 self.laser_np.hide()
+            if self.holo is not None:
+                self.holo.hide()
+            if self.combat is not None:
+                self.combat.clear()
             self.hud.hide()
             self.throttle_root.hide()
         self._restore_world()
@@ -1016,8 +1072,14 @@ class DeepSpaceFlight:
             planets.update(dt)
             return
         blocked = self._input_blocked()
-        if not blocked and dt > 0.0:
+        if self.dead:
+            self._update_death(dt)
+            if not self.active or not self.dead and not self.app.is_holospace_active():
+                return            # the respawn has moved the player home; do not place the ship again
+        elif not blocked and dt > 0.0:
             self._fly(dt)
+        if self.combat is not None and dt > 0.0 and not blocked:
+            self.combat.update(dt)
         self._catch_new_world_nodes()
         self._place(dt)
         self._update_hud(dt)
@@ -1143,8 +1205,78 @@ class DeepSpaceFlight:
         self.pos[2] += step_vec.z
         self.distance_travelled += step_vec.length()
         self.approach = max(0.0, self.approach + step_vec.dot(self.dyson_dir))
+        if self.combat is not None:
+            self.combat.track_travel(step_vec)
         if self.mode != "supercruise":
             self._collide()
+
+    # ------------------------------------------------------------------
+    # Pass 282.76: shields, hull, interdiction, destruction
+    # ------------------------------------------------------------------
+    def take_damage(self, amount: float, source: str = "hit") -> None:
+        if self.dead or not self.active:
+            return
+        dmg = max(0.0, float(amount)) / 100.0
+        absorbed = min(self.shield, dmg)
+        self.shield -= absorbed
+        rest = dmg - absorbed
+        self.hull = max(0.0, self.hull - rest)
+        self.shake = max(self.shake, 0.25 if rest <= 0.0 else 0.5)
+        if source == "collision":
+            self.flash("COLLISION" + ("  //  HULL DAMAGE" if rest > 0.0 else ""), 1.2)
+        elif rest > 0.0 and self.hull < 0.35:
+            self.flash("HULL CRITICAL", 1.2)
+        elif absorbed > 0.0 and self.shield <= 0.0:
+            self.flash("SHIELDS DOWN", 1.4)
+        if self.hull <= 0.0:
+            self._ship_destroyed()
+
+    def interdict(self, message: str) -> None:
+        """Pulled out of supercruise / frame-shift charge by a defence perimeter."""
+        if self.mode == "supercruise":
+            self.cells_root.show()
+            self._clear_cells()
+            self._sync_cells(force=True)
+        fwd = self.ship.getQuat().getForward()
+        self.mode = "normal"
+        self.charge = 0.0
+        self.vel = fwd * (MAX_SPEED * 0.35)
+        self.shake = max(self.shake, 0.8)
+        self.flash(message, 2.4)
+
+    def _ship_destroyed(self) -> None:
+        self.dead = True
+        self.dead_timer = 2.2
+        self.vel = Vec3(0, 0, 0)
+        self.throttle = 0.0
+        self.boosting = False
+        self.shake = 1.0
+        burst_at = (self.pos[0] + 0.0, self.pos[1] + 0.0, self.pos[2] + 0.0)
+        try:
+            fwd = self.ship.getQuat().getForward()
+            burst_at = (self.pos[0] + fwd.x * 25.0, self.pos[1] + fwd.y * 25.0, self.pos[2] + fwd.z * 25.0)
+        except Exception:
+            pass
+        self._spawn_burst(burst_at, 30.0)
+        self.flash("HULL BREACH  //  SHIP LOST  //  RETURNING TO MATRIXCORE", 3.0)
+        print("deep_space_ship_destroyed")
+
+    def _update_death(self, dt: float) -> None:
+        self.dead_timer -= dt
+        self.shake = max(self.shake, 0.4)
+        if self.dead_timer > 0.0:
+            return
+        self.dead = False
+        try:
+            # The same clean exit as TAB: back to the MatrixCore hub.
+            self.app.handle_tab_action()
+            self.deactivate()
+        except Exception as exc:
+            print(f"deep_space_respawn_failed:{exc.__class__.__name__}:{exc}")
+        try:
+            self.app.center_hint["text"] = "SHIP LOST  //  RESPAWNED AT MATRIXCORE"
+        except Exception:
+            pass
 
     def _toggle_supercruise(self) -> None:
         if self.mode == "normal":
@@ -1179,7 +1311,11 @@ class DeepSpaceFlight:
                 if vn < 0.0:
                     self.vel = (self.vel - n * vn * 1.6) * 0.55
                     self.shake = max(self.shake, min(1.0, -vn / 120.0))
-                    self.flash("COLLISION", 1.0)
+                    impact = max(0.0, (-vn - 45.0) * 0.12)
+                    if impact > 0.0:
+                        self.take_damage(impact, "collision")
+                    else:
+                        self.flash("COLLISION", 1.0)
                 return
 
     # ------------------------------------------------------------------
@@ -1394,13 +1530,35 @@ class DeepSpaceFlight:
                 hit_t = t - math.sqrt(max(0.0, rr * rr - miss2))
                 if best is None or hit_t < best[0]:
                     best = (hit_t, cell, rock)
+        enemy_hit = self.combat.ray_hit(self.pos, fwd, LASER_RANGE) if self.combat is not None else None
+        if enemy_hit is not None and (best is None or enemy_hit[0] < best[0]):
+            t_hit, enemy = enemy_hit
+            self._show_laser(max(5.0, t_hit))
+            ex, ey, ez = enemy["pos"]
+            if self.combat.damage(enemy):
+                self._spawn_burst((ex, ey, ez), 26.0)
+                self.shake = max(self.shake, 0.3)
+            else:
+                self._spawn_burst((ex, ey, ez), 6.0)
+            return
         length = LASER_RANGE if best is None else max(5.0, best[0])
         self._show_laser(length)
         if best is None:
             return
         _t, cell, rock = best
         cx, cy, cz, r, idx = rock
-        self.destroyed.add((cell["key"], idx))
+        # Pass 282.76: every hit on an asteroid recharges 5% shield; big rocks take several hits.
+        self.shield = min(1.0, self.shield + 0.05)
+        rid = (cell["key"], idx)
+        hits = self.rock_hits.get(rid, 0) + 1
+        needed = 1 + int(r // 30.0)
+        if hits < needed:
+            self.rock_hits[rid] = hits
+            hx, hy, hz = cx - fwd.x * r * 0.9, cy - fwd.y * r * 0.9, cz - fwd.z * r * 0.9
+            self._spawn_burst((hx, hy, hz), max(6.0, r * 0.18))
+            return
+        self.rock_hits.pop(rid, None)
+        self.destroyed.add(rid)
         self.rocks_destroyed += 1
         self._rebuild_cluster_mesh(cell)
         self._refresh_rocks_near()
@@ -1668,12 +1826,16 @@ class DeepSpaceFlight:
         self.mode_text.setText("   //   ".join(parts))
         self.mode_text.setFg((*(HUD_RED if not self.flight_assist else HUD_AMBER), 0.95))
         # message
+        msg_alpha = 0.0
         if self.message_time > 0.0:
             self.message_time = max(0.0, self.message_time - dt)
+            msg_alpha = min(1.0, self.message_time / 0.5)
             self.msg_text.setText(self.message)
-            self.msg_text.setFg((*HUD_AMBER, min(1.0, self.message_time / 0.5) * 0.95))
+            self.msg_text.setFg((*HUD_AMBER, msg_alpha * 0.95))
         else:
             self.msg_text.setFg((*HUD_AMBER, 0.0))
+        if self.holo is not None:
+            self._update_holo(dt, parts, msg_alpha)
         # Dyson Prime marker
         au = self.dyson_distance_au()
         cam_space = self.sky_cam.getRelativeVector(self.sky_scene, self.dyson_dir)
@@ -1699,6 +1861,32 @@ class DeepSpaceFlight:
             self.dyson_arrow.setPos(math.cos(ang) * min(aspect - 0.15, 0.85 * aspect), 0, math.sin(ang) * 0.82)
             self.dyson_arrow.setR(-math.degrees(ang))
 
+    def _update_holo(self, dt: float, mode_parts, msg_alpha: float) -> None:
+        speed = self.vel.length()
+        speed_text = f"{speed / 1000.0:,.1f} km/s" if self.mode == "supercruise" else f"{int(round(speed))} m/s"
+        threat, threat_warn = "", False
+        combat = self.combat
+        if combat is not None and combat.enemies:
+            title = combat.engaged_title or "SYSTEM"
+            threat = f"HOSTILES  {len(combat.enemies)}  //  {title.upper()} DEFENCE"
+            threat_warn = True
+        elif combat is not None:
+            frac, name = combat.nearest_perimeter()
+            if frac >= 0.5:
+                threat = f"DEFENCE PERIMETER  //  {name.upper()}  {int(min(1.0, frac) * 100)}%"
+                threat_warn = frac >= 0.7
+        if not threat:
+            threat = f"DYSON PRIME  {self.dyson_distance_au():,.1f} AU   //   C  COCKPIT COLOURS"
+        msg = self.message.upper() if msg_alpha > 0.0 else ""
+        warn_words = ("HULL", "SHIELDS DOWN", "INTERDICTED", "HOSTILE", "SHIP LOST", "COLLISION")
+        self.holo.update(dt, {
+            "shield": self.shield, "hull": self.hull, "boost": self.boost_energy, "boosting": self.boosting,
+            "speed_text": speed_text, "throttle": self.throttle,
+            "mode_text": "   ".join(mode_parts), "mode_warn": not self.flight_assist,
+            "message": msg, "message_alpha": msg_alpha, "message_warn": any(w in msg for w in warn_words),
+            "threat": threat, "threat_warn": threat_warn,
+        })
+
     # ------------------------------------------------------------------
     def report(self) -> dict:
         return {
@@ -1716,7 +1904,10 @@ class DeepSpaceFlight:
             "rocks_near": len(self.rocks_near),
             "rocks_destroyed": int(self.rocks_destroyed),
             "boost_energy": round(self.boost_energy, 3),
-            "cockpit_theme": self.COCKPIT_THEMES[self.theme_index]["name"],
+            "cockpit_theme": self.COCKPIT_THEMES[self.theme_index]["name"] if self.COCKPIT_THEMES else "",
+            "shield": round(self.shield, 3),
+            "hull": round(self.hull, 3),
+            "combat": self.combat.report() if self.combat is not None else {},
             "dust_shader": bool(self.shader_ok),
             "hidden_world_nodes": len(self.hidden_scene),
         }
