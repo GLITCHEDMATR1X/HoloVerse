@@ -9501,6 +9501,21 @@ class CommandHubApp(ShowBase):
             gate["_matrixcore_discovered_count"] = int(record.get("count", 1) or 1)
             gate["_matrixcore_discovered_at"] = str(record.get("last_at", ""))
             gates.append(gate)
+        # Pass 282.83: one entry per destination.  Old saves recorded HoloSpace (region 8) under more
+        # than one key, and the HoloSpace Region route is the same place as region 8.
+        unique: list[dict] = []
+        region_numbers: set[int] = set()
+        for gate in gates:
+            if str(gate.get("_matrixcore_gate_kind")) == "region":
+                number = int(gate.get("_matrixcore_region_number", 0) or 0)
+                if number in region_numbers:
+                    continue
+                region_numbers.add(number)
+            unique.append(gate)
+        if 8 in region_numbers:
+            unique = [g for g in unique if not (str(g.get("_matrixcore_gate_kind")) == "dimension"
+                      and canonical_dimension_lookup_key(dict(g.get("manifest") or {}).get("id") or g.get("name")) == "holospace_region")]
+        gates = unique
         gates.sort(key=lambda item: (0 if str(item.get("_matrixcore_gate_kind")) == "region" else 1, str(item.get("_matrixcore_gate_label") or item.get("name") or "").lower()))
         return gates
 
@@ -17489,8 +17504,8 @@ class CommandHubApp(ShowBase):
                 f"Play {getattr(self, 'world_shell_playable_status', 'READY')}  Radius {float(getattr(self, 'world_shell_play_radius', getattr(self.cfg, 'world_shell_play_radius', SURFACE_OUTER_RADIUS))):.0f}\n"
                 f"Boundary {getattr(self, 'world_shell_boundary_status', 'READY')}  Checkpoints {getattr(self, 'world_shell_checkpoint_status', '0/0')}\n"
                 f"Ground lanes {'ON' if getattr(self.cfg, 'world_shell_ground_continuity', True) else 'OFF'}  Height hints {'ON' if getattr(self.cfg, 'world_shell_collision_height_hints', True) else 'OFF'}\n"
-                f"B/N cycle, P play, C reset pickups // Shift+F9 dev numbers"
-            )
+                + ("DEV ON // B/N cycle biome, P play, C reset pickups, 0-9 routes" if getattr(self, "dev_region_number_travel", False) else "")
+            ).rstrip()
         elif self.menu_tab == "gates":
             gates = self.matrixcore_dimension_gate_modes() if hasattr(self, "matrixcore_dimension_gate_modes") else []
             page_size = max(1, min(8, int(getattr(self, "menu_action_capacity", 10) or 10) - 2))
@@ -17627,6 +17642,15 @@ class CommandHubApp(ShowBase):
                 return
         except Exception:
             pass
+        # Pass 282.83: replacing ShowBase.windowEvent also dropped its aspect-ratio update, so a
+        # resized window (windowed mode) stretched the 3D view and all 2D UI.
+        try:
+            if window is not None and window == self.win and self.win.getYSize() > 0:
+                aspect = self.getAspectRatio(self.win)
+                if abs(float(self.camLens.getAspectRatio()) - aspect) > 1e-4 or abs(float(self.aspect2d.getSx()) - 1.0 / aspect) > 1e-4:
+                    self.adjustWindowAspectRatio(aspect)
+        except Exception as exc:
+            print(f"window_aspect_update_failed err={exc.__class__.__name__}:{exc}")
         if hasattr(self, "relayout_ui"):
             self.relayout_ui()
         if (
